@@ -9,7 +9,7 @@ PAPER_TRADING = True  # False 로 바꾸면 실거래 모드 (미구현)
 # ── 자본 ────────────────────────────────────────────────
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))  # USDC
 
-# ── LP 설정 ──────────────────────────────────────────────
+# ── 단일 풀 설정 (main.py 전용 — main_multi.py는 pool_config.py 사용) ──────
 LP_TOKEN          = os.getenv("LP_TOKEN", "ETH")
 LP_FEE_TIER       = float(os.getenv("LP_FEE_TIER", "0.3"))   # 수수료율 %
 LP_RANGE_PCT      = float(os.getenv("LP_RANGE_PCT", "20"))    # 진입가 기준 ±%

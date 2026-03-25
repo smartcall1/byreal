@@ -152,7 +152,7 @@ class PaperTradingEngine:
         initial_delta = clmm_math.get_delta(L, initial_price, price_lower, price_upper)
 
         self.perp = PerpPosition(
-            asset=config.LP_TOKEN,
+            asset=self.pool_cfg.hedge_asset if self.pool_cfg else config.LP_TOKEN,
             size=initial_delta,
             entry_price=initial_price,
             margin=perp_margin,
