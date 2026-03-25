@@ -111,6 +111,10 @@ class PaperTradingEngine:
         self.range_reset_count  = 0
         self.range_reset_history: list[RangeResetRecord] = []
 
+        # 청산 경고 쿨다운 (WS 1초 호출 시 로그 스팸 방지)
+        self._liq_warn_ts: float = 0.0
+        self._liq_emergency_ts: float = 0.0
+
     # ── 초기화 ──────────────────────────────────────────
 
     async def initialize(self, initial_price: float):
@@ -350,30 +354,40 @@ class PaperTradingEngine:
     # ── 청산 버퍼 관리 ───────────────────────────────────
 
     def _check_liquidation_buffer(self, current_price: float):
-        """청산가까지의 버퍼를 점검하고, 위험 시 마진을 자동 보충한다."""
+        """청산가까지의 버퍼를 점검하고, 위험 시 마진을 자동 보충한다.
+
+        WS에서 1초마다 호출되므로 쿨다운으로 로그 스팸을 방지한다.
+        """
         if not self.perp or self.perp.size <= 0:
             return
 
         liq_price = self.perp.liquidation_price
         buffer    = (liq_price - current_price) / current_price
+        now       = time.time()
 
         if buffer < 0:
-            logger.critical(
-                f"[LIQ] LIQUIDATED  현재가 ${current_price:,.2f} > 청산가 ${liq_price:,.2f}"
-            )
+            if now - self._liq_emergency_ts > 5.0:
+                logger.critical(
+                    f"[LIQ] LIQUIDATED  현재가 ${current_price:,.2f} > 청산가 ${liq_price:,.2f}"
+                )
+                self._liq_emergency_ts = now
             return
 
         if buffer < config.LIQUIDATION_BUFFER_EMERGENCY:
-            logger.critical(
-                f"[LIQ] 긴급 마진 추가!  버퍼 {buffer*100:.1f}% < {config.LIQUIDATION_BUFFER_EMERGENCY*100:.0f}%  "
-                f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
-            )
+            if now - self._liq_emergency_ts > 10.0:
+                logger.critical(
+                    f"[LIQ] 긴급 마진 추가!  버퍼 {buffer*100:.1f}%  "
+                    f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
+                )
+                self._liq_emergency_ts = now
             self._emergency_topup(current_price)
         elif buffer < config.LIQUIDATION_BUFFER_WARN:
-            logger.warning(
-                f"[LIQ] 청산 접근  버퍼 {buffer*100:.1f}%  "
-                f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
-            )
+            if now - self._liq_warn_ts > 30.0:
+                logger.warning(
+                    f"[LIQ] 청산 접근  버퍼 {buffer*100:.1f}%  "
+                    f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
+                )
+                self._liq_warn_ts = now
 
     def _emergency_topup(self, current_price: float):
         """LP 가치 일부를 Perp 마진으로 이전해 청산을 방어한다.

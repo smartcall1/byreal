@@ -151,6 +151,26 @@ class MultiPoolRunner:
         )
         print("=" * W)
 
+    # ── WS 실시간 청산 감시 ────────────────────────────────
+
+    async def ws_monitor(self, ws_feed):
+        """WS 가격 기반으로 매 1초 청산 버퍼 점검.
+
+        REST 폴링(5분)과 별개 Task로 동시 실행되므로
+        가격 급변 시 즉각 _emergency_topup이 트리거된다.
+        """
+        logger.info("[WS-MON] 청산 버퍼 실시간 감시 시작")
+        while True:
+            for name, engine in list(self.engines.items()):
+                if not engine.perp or engine.perp.leverage <= 1.0:
+                    continue
+                price = ws_feed.get_price(engine.pool_cfg.lp_token)
+                if price is None:
+                    continue
+                self._last_prices[name] = price
+                engine._check_liquidation_buffer(price)
+            await asyncio.sleep(1)
+
     def final_report(self):
         logger.info("━" * 80)
         logger.info(" 최종 결과 (봇 종료)")

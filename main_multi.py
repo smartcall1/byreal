@@ -39,6 +39,7 @@ import config
 from pool_config import POOL_CONFIGS
 from price_feed import PriceFeed
 from multi_runner import MultiPoolRunner
+from ws_feed import WSPriceFeed
 
 
 async def run():
@@ -48,22 +49,36 @@ async def run():
                 f"| 풀 수: {len(POOL_CONFIGS)}")
     for cfg in POOL_CONFIGS:
         logger.info(f"   {cfg.name:<14} ${cfg.capital:,.0f}  range=±{cfg.range_pct}%  "
-                    f"hedge={cfg.hedge_asset}")
+                    f"lev={cfg.leverage}x  hedge={cfg.hedge_asset}")
     logger.info(f" 리밸런싱: {config.REBALANCE_INTERVAL}s  "
                 f"| 델타 임계값: {config.DELTA_THRESHOLD*100:.0f}%  "
                 f"| 리포트: {config.LOG_INTERVAL}s")
     logger.info("=" * 80)
 
     price_feed = PriceFeed()
-    runner     = MultiPoolRunner(price_feed)
+    ws_feed    = WSPriceFeed()
 
-    # ── 초기화 ───────────────────────────────────────────
+    # ── WS 연결 먼저 (초기화 전 가격 수신) ───────────────
+    ws_task = asyncio.create_task(ws_feed.run())
+    logger.info("[BOOT] WebSocket 연결 대기 중...")
+    try:
+        await ws_feed.wait_ready(timeout=10.0)
+        logger.info("[BOOT] WS 가격 피드 준비 완료")
+    except asyncio.TimeoutError:
+        logger.warning("[BOOT] WS 타임아웃 — REST 폴백으로 계속 진행")
+
+    # ── 풀 초기화 (REST) ─────────────────────────────────
+    runner = MultiPoolRunner(price_feed)
     logger.info("[BOOT] 풀 초기화 중 (가격·풀 데이터 조회)...")
     await runner.initialize()
 
+    # ── WS 청산 감시 Task 시작 ────────────────────────────
+    ws_mon_task = asyncio.create_task(runner.ws_monitor(ws_feed))
+    logger.info("[BOOT] WS 청산 버퍼 감시 Task 시작")
+
     last_log_ts = 0.0
 
-    # ── 메인 루프 ─────────────────────────────────────────
+    # ── 메인 폴링 루프 (REST) ─────────────────────────────
     try:
         while True:
             loop_start = time.time()
@@ -86,9 +101,12 @@ async def run():
         logger.error(f"[ERROR] {e}", exc_info=True)
 
     finally:
+        ws_mon_task.cancel()
+        ws_task.cancel()
         runner.final_report()
         await price_feed.close()
-        logger.info("[STOP] 종료. logs/multi_bot.log / logs/pnl_history.csv 확인.")
+        await ws_feed.stop()
+        logger.info("[STOP] 종료. logs/multi_bot.log 확인.")
 
 
 if __name__ == "__main__":
