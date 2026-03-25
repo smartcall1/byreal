@@ -29,6 +29,17 @@ ESTIMATED_POOL_DAILY_VOLUME = float(os.getenv("ESTIMATED_POOL_DAILY_VOLUME", "7_
 ESTIMATED_POOL_TVL          = float(os.getenv("ESTIMATED_POOL_TVL", "3_000_000"))
 LP_TREASURY_CUT             = 0.12  # Byreal treasury 12%, LP 88% 귀속
 
+# ── 실시간 풀 데이터 (DeFi Llama) ───────────────────────
+USE_LIVE_POOL_DATA          = os.getenv("USE_LIVE_POOL_DATA", "true").lower() == "true"
+# Byreal 전체 TVL·수수료 중 ETH/USDC 풀 비중 (DeFi Llama 값에 적용)
+POOL_ETH_USDC_SHARE         = float(os.getenv("POOL_ETH_USDC_SHARE", "0.30"))
+POOL_STATS_REFRESH_INTERVAL = int(os.getenv("POOL_STATS_REFRESH_INTERVAL", "300"))  # 초
+
+# ── LP 범위 리셋 ─────────────────────────────────────────
+RANGE_RESET_ENABLED   = os.getenv("RANGE_RESET_ENABLED", "true").lower() == "true"
+LP_RESET_SLIPPAGE_PCT = float(os.getenv("LP_RESET_SLIPPAGE_PCT", "0.15"))  # 출금+입금 각 0.15%
+SOLANA_TX_COST_USDC   = float(os.getenv("SOLANA_TX_COST_USDC", "0.003"))   # Solana 가스비 추정
+
 # ── 리포팅 ───────────────────────────────────────────────
 LOG_INTERVAL = int(os.getenv("LOG_INTERVAL", "60"))  # 콘솔 출력 주기 (초)
 

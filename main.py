@@ -72,12 +72,17 @@ async def run():
         while True:
             loop_start = time.time()
 
-            # 가격 + 펀딩레이트 조회
+            # 가격 + 펀딩레이트 조회 (매 인터벌)
             current_price = await price_feed.get_price(config.LP_TOKEN)
             funding_rate  = await price_feed.get_funding_rate(config.LP_TOKEN)
 
-            # 수수료·펀딩 누적 + 델타 리밸런싱
-            await engine.update(current_price, funding_rate)
+            # 풀 통계 조회 (내부 캐시로 5분마다 갱신)
+            pool_stats = None
+            if config.USE_LIVE_POOL_DATA:
+                pool_stats = await price_feed.get_byreal_stats()
+
+            # 수수료·펀딩 누적 + 범위 리셋 + 델타 리밸런싱
+            await engine.update(current_price, funding_rate, pool_stats)
 
             # 정기 리포트
             now = time.time()

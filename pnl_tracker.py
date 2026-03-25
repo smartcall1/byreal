@@ -95,6 +95,36 @@ class PnLTracker:
                 f" 델타 잔여  : {hedge_diff:>+.6f} ETH  "
                 f"(LP {lp_delta:.6f} vs Hedge {hedge_delta:.6f})"
             )
+
+        # ── 포지션 상태 정보 ───────────────────────────────
+        if self.engine.lp and self.engine.perp:
+            lp = self.engine.lp
+            perp = self.engine.perp
+
+            # 범위까지 거리 (%)
+            dist_lower = (current_price - lp.price_lower) / current_price * 100
+            dist_upper = (lp.price_upper - current_price) / current_price * 100
+
+            # Perp 레버리지 (notional / margin)
+            notional = perp.size * current_price
+            leverage = notional / max(perp.margin, 1.0)
+
+            # 풀 데이터 소스
+            stats_source = getattr(self.engine, '_last_pool_source', 'unknown')
+
+            logger.info(
+                f" 범위 여유  : 하단 -{dist_lower:.1f}%  상단 +{dist_upper:.1f}%"
+                f"  |  리셋 {self.engine.range_reset_count}회"
+            )
+            logger.info(
+                f" Perp 레버리지: {leverage:.2f}x  "
+                f"(노셔널 ${notional:,.0f} / 마진 ${perp.margin:,.0f})"
+            )
+            if config.USE_LIVE_POOL_DATA:
+                logger.info(f" 풀 데이터  : DeFi Llama 실시간")
+            else:
+                logger.info(f" 풀 데이터  : config 추정값")
+
         logger.info("=" * 68)
 
     # ── 최종 리포트 ──────────────────────────────────────

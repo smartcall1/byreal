@@ -61,6 +61,20 @@ class RebalanceRecord:
     cost: float
 
 
+@dataclass
+class RangeResetRecord:
+    timestamp: float
+    old_lower: float
+    old_upper: float
+    new_lower: float
+    new_upper: float
+    price: float
+    lp_value_before: float
+    slippage_cost: float
+    tx_cost: float
+    perp_cost: float
+
+
 # ── 메인 엔진 ─────────────────────────────────────────────
 
 class PaperTradingEngine:
@@ -69,17 +83,25 @@ class PaperTradingEngine:
         self.lp:   Optional[LPPosition]  = None
         self.perp: Optional[PerpPosition] = None
 
-        self.initial_capital   = config.INITIAL_CAPITAL
-        self.rebalance_count   = 0
-        self.rebalance_costs   = 0.0
+        self.initial_capital    = config.INITIAL_CAPITAL
+        self._original_lp_capital: float = 0.0  # 최초 LP 투입 자본, 불변
+
+        # 리밸런싱 (Perp Short 조정)
+        self.rebalance_count    = 0
+        self.rebalance_costs    = 0.0
         self.rebalance_history: list[RebalanceRecord] = []
         self._last_rebalance_ts = 0.0
+
+        # 범위 리셋 (LP 재진입)
+        self.range_reset_count  = 0
+        self.range_reset_history: list[RangeResetRecord] = []
 
     # ── 초기화 ──────────────────────────────────────────
 
     async def initialize(self, initial_price: float):
         lp_capital  = self.initial_capital * config.LP_CAPITAL_RATIO
         perp_margin = self.initial_capital * (1 - config.LP_CAPITAL_RATIO)
+        self._original_lp_capital = lp_capital  # 리셋 이후에도 변하지 않음
 
         price_lower = initial_price * (1 - config.LP_RANGE_PCT / 100)
         price_upper = initial_price * (1 + config.LP_RANGE_PCT / 100)
@@ -120,8 +142,13 @@ class PaperTradingEngine:
 
     # ── 메인 업데이트 루프 ───────────────────────────────
 
-    async def update(self, current_price: float, funding_rate_1h: float) -> bool:
-        """매 인터벌 호출. 수수료·펀딩 누적 → 델타 체크 → 리밸런싱 여부 반환."""
+    async def update(
+        self,
+        current_price: float,
+        funding_rate_1h: float,
+        pool_stats: dict | None = None,
+    ) -> bool:
+        """매 인터벌 호출. 수수료·펀딩 누적 → 범위 리셋 → 델타 리밸런싱."""
         if not self.lp or not self.perp:
             return False
 
@@ -137,21 +164,16 @@ class PaperTradingEngine:
                 self.lp.liquidity, current_price,
                 self.lp.price_lower, self.lp.price_upper
             )
-            fee = clmm_math.estimate_fee_for_interval(
-                position_value=lp_value,
-                interval_seconds=interval_sec,
-                fee_tier_pct=config.LP_FEE_TIER,
-                pool_daily_volume=config.ESTIMATED_POOL_DAILY_VOLUME,
-                pool_tvl=config.ESTIMATED_POOL_TVL,
-                lp_treasury_cut=config.LP_TREASURY_CUT,
-            )
+            fee = self._calc_fee_for_interval(lp_value, interval_sec, pool_stats)
             self.lp.fees_accrued += fee
         else:
+            # 범위 이탈 — 리셋 여부 판단
             logger.warning(
                 f"[OUT OF RANGE] ${current_price:,.2f}  "
-                f"범위: ${self.lp.price_lower:,.0f} ~ ${self.lp.price_upper:,.0f}  "
-                f"수수료 0"
+                f"범위: ${self.lp.price_lower:,.0f} ~ ${self.lp.price_upper:,.0f}"
             )
+            if config.RANGE_RESET_ENABLED:
+                await self._reset_range(current_price)
 
         # 2. Perp 펀딩 누적 (Short 기준: 양수면 수령)
         perp_notional = self.perp.size * current_price
@@ -166,6 +188,125 @@ class PaperTradingEngine:
         self.perp.unrealized_pnl = (self.perp.entry_price - current_price) * self.perp.size
 
         return rebalanced
+
+    # ── 수수료 계산 헬퍼 ─────────────────────────────────
+
+    def _calc_fee_for_interval(
+        self,
+        position_value: float,
+        interval_sec: float,
+        pool_stats: dict | None,
+    ) -> float:
+        """인터벌 동안 내 포지션이 받을 수수료 추정.
+
+        pool_stats가 있으면 DeFi Llama 실제 데이터 사용.
+        없으면 config 추정값 사용.
+
+        공식: my_fee = (내 LP 가치 / 풀 TVL) × 풀 일 수수료 × (interval / 86400)
+        """
+        interval_days = interval_sec / 86_400
+
+        if pool_stats and config.USE_LIVE_POOL_DATA:
+            pool_tvl        = pool_stats["tvl"] * config.POOL_ETH_USDC_SHARE
+            pool_daily_fees = pool_stats["daily_lp_fees"] * config.POOL_ETH_USDC_SHARE
+        else:
+            pool_tvl        = config.ESTIMATED_POOL_TVL
+            pool_daily_fees = (
+                config.ESTIMATED_POOL_DAILY_VOLUME
+                * (config.LP_FEE_TIER / 100)
+                * (1 - config.LP_TREASURY_CUT)
+            )
+
+        if pool_tvl <= 0:
+            return 0.0
+
+        my_share = position_value / pool_tvl
+        return pool_daily_fees * my_share * interval_days
+
+    # ── LP 범위 리셋 ──────────────────────────────────────
+
+    async def _reset_range(self, current_price: float) -> bool:
+        """범위 이탈 시 현재가 중심으로 LP 재진입.
+
+        비용:
+          - 출금 슬리피지: LP 가치 × LP_RESET_SLIPPAGE_PCT / 100
+          - 입금 슬리피지: 재투입 가치 × LP_RESET_SLIPPAGE_PCT / 100
+          - Solana 가스비: SOLANA_TX_COST_USDC × 2 (withdraw + deposit)
+          - Perp 조정: |새 델타 - 구 델타| × 현재가 × PERP_TAKER_FEE
+        """
+        if not self.lp or not self.perp:
+            return False
+
+        lp_value_before = clmm_math.get_position_value(
+            self.lp.liquidity, current_price,
+            self.lp.price_lower, self.lp.price_upper,
+        )
+
+        # ① 슬리피지 비용 (출금 + 재입금)
+        slippage_cost = lp_value_before * (config.LP_RESET_SLIPPAGE_PCT / 100) * 2
+        # ② Solana 가스비 (withdraw + deposit = 2 tx)
+        tx_cost = config.SOLANA_TX_COST_USDC * 2
+        # ③ 재투입 자본
+        new_capital = lp_value_before - slippage_cost - tx_cost
+
+        # 새 범위 (현재가 중심)
+        new_lower = current_price * (1 - config.LP_RANGE_PCT / 100)
+        new_upper = current_price * (1 + config.LP_RANGE_PCT / 100)
+
+        new_L   = clmm_math.calc_liquidity_from_deposit(new_capital, current_price, new_lower, new_upper)
+        new_eth, new_usdc = clmm_math.get_amounts(new_L, current_price, new_lower, new_upper)
+        new_delta = clmm_math.get_delta(new_L, current_price, new_lower, new_upper)
+
+        # ④ Perp 조정: 기존 Short 전체 실현 후 새 델타로 재진입
+        old_perp_size = self.perp.size
+        realized_close = (self.perp.entry_price - current_price) * old_perp_size
+        self.perp.realized_pnl += realized_close
+
+        perp_diff = abs(new_delta - old_perp_size)
+        perp_cost = perp_diff * current_price * config.PERP_TAKER_FEE
+        # 기존 Short 청산 비용 (항상 발생)
+        perp_cost += old_perp_size * current_price * config.PERP_TAKER_FEE
+
+        self.perp.size         = new_delta
+        self.perp.entry_price  = current_price
+        self.perp.unrealized_pnl = 0.0
+
+        # 범위 리셋 이력 기록
+        rec = RangeResetRecord(
+            timestamp=time.time(),
+            old_lower=self.lp.price_lower,
+            old_upper=self.lp.price_upper,
+            new_lower=new_lower,
+            new_upper=new_upper,
+            price=current_price,
+            lp_value_before=lp_value_before,
+            slippage_cost=slippage_cost,
+            tx_cost=tx_cost,
+            perp_cost=perp_cost,
+        )
+        self.range_reset_history.append(rec)
+        self.range_reset_count += 1
+
+        # LP 포지션 갱신
+        self.lp.price_lower   = new_lower
+        self.lp.price_upper   = new_upper
+        self.lp.liquidity     = new_L
+        self.lp.initial_eth   = new_eth
+        self.lp.initial_usdc  = new_usdc
+        self.lp.initial_value = new_capital   # IL 기준점 리셋
+        self.lp.entry_price   = current_price
+        self.lp.in_range      = True
+        self.lp.last_reset_price = current_price
+
+        total_cost = slippage_cost + tx_cost + perp_cost
+        logger.info(
+            f"[RANGE RESET #{self.range_reset_count}] "
+            f"${current_price:,.2f}  |  "
+            f"새 범위: ${new_lower:,.0f} ~ ${new_upper:,.0f}  |  "
+            f"재투입: ${new_capital:.2f}  |  "
+            f"총비용: ${total_cost:.4f} (슬리피지 ${slippage_cost:.4f} + 가스 ${tx_cost:.4f} + Perp ${perp_cost:.4f})"
+        )
+        return True
 
     # ── 델타 리밸런싱 ────────────────────────────────────
 
@@ -249,16 +390,22 @@ class PaperTradingEngine:
         )
 
     def get_net_pnl(self, current_price: float) -> float:
-        """총 순손익 = LP 가치 변화 + Perp PnL + 수수료 + 펀딩 - 비용
+        """총 순손익 = 현재 포트폴리오 가치 - 최초 투입 자본
 
-        LP 가치 변화 + Perp PnL ≈ IL (방향 노출 상쇄)
-        → 순손익 ≈ IL + 수수료 + 펀딩 (수수료가 IL을 초과하면 수익)
+        구성:
+          LP 가치 변화   (vs 최초 LP 자본, 범위 리셋 비용 이미 반영)
+        + Perp PnL      (≈ -HODL_gain → LP 방향 노출 상쇄)
+        + 수수료 수익    ← 핵심 수익
+        + 펀딩 수령
+        - Perp 리밸런싱 비용
+        ──────────────────────────────────────────
+        ≈ IL + 수수료 + 펀딩 (범위 리셋 비용은 LP 가치에 이미 차감)
         """
-        lp_gain = self.get_lp_value(current_price) - (self.lp.initial_value if self.lp else 0.0)
+        lp_gain = self.get_lp_value(current_price) - self._original_lp_capital
         fees    = self.lp.fees_accrued if self.lp else 0.0
         p_pnl   = self.perp.pnl if self.perp else 0.0
         funding = self.perp.funding_received if self.perp else 0.0
-        costs   = self.rebalance_costs
+        costs   = self.rebalance_costs  # 범위 리셋 비용은 LP 가치에 이미 반영
         return lp_gain + fees + p_pnl + funding - costs
 
     def get_current_delta(self, current_price: float) -> float:
