@@ -1,0 +1,35 @@
+# 환경변수 / 시크릿
+.env
+.env.*
+!.env.example
+
+# 로그 / 데이터
+logs/
+*.log
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

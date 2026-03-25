@@ -1,0 +1,37 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── 모드 ────────────────────────────────────────────────
+PAPER_TRADING = True  # False 로 바꾸면 실거래 모드 (미구현)
+
+# ── 자본 ────────────────────────────────────────────────
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))  # USDC
+
+# ── LP 설정 ──────────────────────────────────────────────
+LP_TOKEN          = os.getenv("LP_TOKEN", "ETH")
+LP_FEE_TIER       = float(os.getenv("LP_FEE_TIER", "0.3"))   # 수수료율 %
+LP_RANGE_PCT      = float(os.getenv("LP_RANGE_PCT", "20"))    # 진입가 기준 ±%
+LP_CAPITAL_RATIO  = float(os.getenv("LP_CAPITAL_RATIO", "0.7"))  # 총 자본 중 LP 비율
+
+# ── Perps 설정 (Hyperliquid) ─────────────────────────────
+PERP_TAKER_FEE    = 0.00045   # 0.045% taker
+PERP_MAKER_FEE    = -0.00015  # -0.015% maker rebate (사용 안 함, 페이퍼에서 taker 가정)
+
+# ── 리밸런싱 ─────────────────────────────────────────────
+REBALANCE_INTERVAL = int(os.getenv("REBALANCE_INTERVAL", "300"))   # 초
+DELTA_THRESHOLD    = float(os.getenv("DELTA_THRESHOLD", "0.05"))   # 델타 편차 5% 이상이면 리밸런싱
+
+# ── 풀 볼륨 추정 (페이퍼 수수료 시뮬레이션용) ──────────────
+# Byreal 전체 일 거래량 ~$25M 중 ETH/USDC 풀 약 30% 가정
+ESTIMATED_POOL_DAILY_VOLUME = float(os.getenv("ESTIMATED_POOL_DAILY_VOLUME", "7_500_000"))
+ESTIMATED_POOL_TVL          = float(os.getenv("ESTIMATED_POOL_TVL", "3_000_000"))
+LP_TREASURY_CUT             = 0.12  # Byreal treasury 12%, LP 88% 귀속
+
+# ── 리포팅 ───────────────────────────────────────────────
+LOG_INTERVAL = int(os.getenv("LOG_INTERVAL", "60"))  # 콘솔 출력 주기 (초)
+
+# ── 텔레그램 알림 (선택) ─────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
