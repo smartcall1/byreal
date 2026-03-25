@@ -100,7 +100,10 @@ class MultiPoolRunner:
                 in_range = engine.lp.in_range
                 resets   = engine.range_reset_count
 
-                apr_pct = (net_pnl / capital) * (8760 / max(elapsed / 3600, 0.001)) * 100
+                apr_pct = (
+                    (net_pnl / capital) * (8760 / (elapsed / 3600)) * 100
+                    if elapsed >= 600 else None  # 10분 미만은 계산 안 함
+                )
                 liq_buf = engine.get_liquidation_buffer(price) * 100
             except Exception:
                 continue
@@ -120,7 +123,7 @@ class MultiPoolRunner:
 
         for name, pool_tvl, cap, lp_val, fees, perp, net, apr, liq_buf, status in rows:
             tvl_str = f"${pool_tvl/1000:.0f}k" if pool_tvl >= 1000 else f"${pool_tvl:.0f}"
-            # 청산 버퍼 표시: 8% 이하 빨강(!), 15% 이하 주의(*), 정상(공백)
+            apr_str = f"{apr:>+6.1f}%" if apr is not None else "   N/A "
             buf_flag = "!" if liq_buf < 8 else ("*" if liq_buf < 15 else " ")
             print(
                 f" {name:<14} {tvl_str:>9} "
@@ -129,14 +132,18 @@ class MultiPoolRunner:
                 f"${fees:>+7.4f} "
                 f"${perp:>+7.4f} "
                 f"${net:>+7.4f} "
-                f"{apr:>+6.1f}% "
+                f"{apr_str} "
                 f"{buf_flag}{liq_buf:>5.1f}% "
                 f" {status}"
             )
 
         # ── 합계 ───────────────────────────────────────────
-        total_apr = (total_net / max(total_capital, 1)) * (8760 / max(elapsed / 3600, 0.001)) * 100
+        total_apr = (
+            (total_net / max(total_capital, 1)) * (8760 / (elapsed / 3600)) * 100
+            if elapsed >= 600 else None
+        )
         in_str = f"{sum(1 for _,e in self.engines.items() if e.lp and e.lp.in_range)}/{len(self.engines)} ✓"
+        total_apr_str = f"{total_apr:>+6.1f}%" if total_apr is not None else "   N/A "
         print(" " + "═" * (W - 2))
         print(
             f" {'TOTAL':<14} {'':>9} "
@@ -145,7 +152,7 @@ class MultiPoolRunner:
             f"${total_fees:>+7.4f} "
             f"${total_perp:>+7.4f} "
             f"${total_net:>+7.4f} "
-            f"{total_apr:>+6.1f}% "
+            f"{total_apr_str} "
             f"{'':>7} "
             f" {in_str}"
         )
