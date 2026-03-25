@@ -15,6 +15,7 @@ from typing import Optional
 
 import clmm_math
 import config
+from pool_config import PoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,13 @@ class RangeResetRecord:
 # ── 메인 엔진 ─────────────────────────────────────────────
 
 class PaperTradingEngine:
-    def __init__(self, price_feed):
+    def __init__(self, price_feed, pool_cfg: PoolConfig | None = None):
         self.price_feed = price_feed
+        self.pool_cfg   = pool_cfg  # None이면 global config 사용 (단일 풀 모드)
         self.lp:   Optional[LPPosition]  = None
         self.perp: Optional[PerpPosition] = None
 
-        self.initial_capital    = config.INITIAL_CAPITAL
+        self.initial_capital    = pool_cfg.capital if pool_cfg else config.INITIAL_CAPITAL
         self._original_lp_capital: float = 0.0  # 최초 LP 투입 자본, 불변
 
         # 리밸런싱 (Perp Short 조정)
@@ -101,10 +103,11 @@ class PaperTradingEngine:
     async def initialize(self, initial_price: float):
         lp_capital  = self.initial_capital * config.LP_CAPITAL_RATIO
         perp_margin = self.initial_capital * (1 - config.LP_CAPITAL_RATIO)
-        self._original_lp_capital = lp_capital  # 리셋 이후에도 변하지 않음
+        self._original_lp_capital = lp_capital
 
-        price_lower = initial_price * (1 - config.LP_RANGE_PCT / 100)
-        price_upper = initial_price * (1 + config.LP_RANGE_PCT / 100)
+        range_pct   = self.pool_cfg.range_pct if self.pool_cfg else config.LP_RANGE_PCT
+        price_lower = initial_price * (1 - range_pct / 100)
+        price_upper = initial_price * (1 + range_pct / 100)
 
         L = clmm_math.calc_liquidity_from_deposit(
             lp_capital, initial_price, price_lower, price_upper
@@ -207,13 +210,22 @@ class PaperTradingEngine:
         interval_days = interval_sec / 86_400
 
         if pool_stats and config.USE_LIVE_POOL_DATA:
-            pool_tvl        = pool_stats["tvl"] * config.POOL_ETH_USDC_SHARE
-            pool_daily_fees = pool_stats["daily_lp_fees"] * config.POOL_ETH_USDC_SHARE
+            src = pool_stats.get("source", "")
+            if src == "geckoterminal":
+                # 풀별 GT 데이터: 이미 해당 풀의 수치 → share 비율 불필요
+                fee_tier = self.pool_cfg.fee_tier if self.pool_cfg else config.LP_FEE_TIER
+                pool_tvl        = pool_stats["tvl"]
+                pool_daily_fees = pool_stats["vol_24h"] * (fee_tier / 100) * (1 - config.LP_TREASURY_CUT)
+            else:
+                # 프로토콜 전체 DeFi Llama 데이터 → share 비율 적용
+                pool_tvl        = pool_stats["tvl"] * config.POOL_ETH_USDC_SHARE
+                pool_daily_fees = pool_stats["daily_lp_fees"] * config.POOL_ETH_USDC_SHARE
         else:
+            fee_tier = self.pool_cfg.fee_tier if self.pool_cfg else config.LP_FEE_TIER
             pool_tvl        = config.ESTIMATED_POOL_TVL
             pool_daily_fees = (
                 config.ESTIMATED_POOL_DAILY_VOLUME
-                * (config.LP_FEE_TIER / 100)
+                * (fee_tier / 100)
                 * (1 - config.LP_TREASURY_CUT)
             )
 

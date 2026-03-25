@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 HL_API             = "https://api.hyperliquid.xyz/info"
 DEFILLAMA_TVL_API  = "https://api.llama.fi/tvl/byreal"
 DEFILLAMA_FEES_API = "https://api.llama.fi/summary/fees/byreal"
+GT_POOL_API        = "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_id}"
 
 # Byreal Perps는 Hyperliquid 엔진 위에서 동작하므로 동일 데이터 사용
 ASSET_MAP = {
@@ -25,9 +26,11 @@ ASSET_MAP = {
 class PriceFeed:
     def __init__(self):
         self._session: aiohttp.ClientSession | None = None
-        # DeFi Llama 캐시 (POOL_STATS_REFRESH_INTERVAL 초마다 갱신)
+        # DeFi Llama 프로토콜 전체 캐시
         self._stats_cache: dict = {}
         self._stats_cache_ts: float = 0.0
+        # GeckoTerminal 풀별 캐시 {pool_id: (ts, data)}
+        self._gt_pool_cache: dict[str, tuple[float, dict]] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -35,8 +38,13 @@ class PriceFeed:
         return self._session
 
     async def get_price(self, asset: str) -> float:
-        """현재 mid 가격 조회 (USDC 기준)"""
-        hl_asset = ASSET_MAP.get(asset, asset)
+        """현재 mid 가격 조회 (USDC 기준).
+
+        pool_config.ASSET_PRICE_MAP을 통해
+        WETH→ETH, XAUt0→PAXG 등 자동 매핑.
+        """
+        from pool_config import ASSET_PRICE_MAP
+        hl_asset = ASSET_PRICE_MAP.get(asset) or ASSET_MAP.get(asset, asset)
         session = await self._get_session()
         try:
             async with session.post(HL_API, json={"type": "allMids"}) as resp:
@@ -44,7 +52,7 @@ class PriceFeed:
                 price = float(data[hl_asset])
                 return price
         except Exception as e:
-            logger.error(f"[PriceFeed] 가격 조회 실패 ({asset}): {e}")
+            logger.error(f"[PriceFeed] 가격 조회 실패 ({asset} → {hl_asset}): {e}")
             raise
 
     async def get_funding_rate(self, asset: str) -> float:
@@ -76,6 +84,52 @@ class PriceFeed:
         price = await self.get_price(asset)
         funding = await self.get_funding_rate(asset)
         return {"price": price, "funding_rate_1h": funding}
+
+    async def get_pool_stats_gt(self, pool_id: str) -> dict:
+        """GeckoTerminal에서 특정 풀의 TVL + 24h 수수료 조회 (5분 캐시).
+
+        반환값:
+          tvl            : 풀 TVL (USD)
+          daily_lp_fees  : LP 귀속 24h 수수료 (USD)
+          vol_24h        : 24h 거래량
+          source         : "geckoterminal" | "fallback"
+        """
+        now = time.time()
+        cached = self._gt_pool_cache.get(pool_id)
+        if cached and now - cached[0] < config.POOL_STATS_REFRESH_INTERVAL:
+            return cached[1]
+
+        session = await self._get_session()
+        url = GT_POOL_API.format(pool_id=pool_id)
+        try:
+            async with session.get(
+                url,
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                data = await r.json()
+                attr = data["data"]["attributes"]
+                tvl    = float(attr.get("reserve_in_usd") or 0)
+                vol24h = float((attr.get("volume_usd") or {}).get("h24") or 0)
+                lp_fees = vol24h * (1 - config.LP_TREASURY_CUT) * 0.003  # 0.3% fee
+                stats = {
+                    "tvl":           tvl,
+                    "vol_24h":       vol24h,
+                    "daily_lp_fees": lp_fees,
+                    "source":        "geckoterminal",
+                }
+                self._gt_pool_cache[pool_id] = (now, stats)
+                return stats
+        except Exception as e:
+            logger.warning(f"[PoolStats/GT] {pool_id[:8]}... 조회 실패 ({e})")
+            fallback = {
+                "tvl":           config.ESTIMATED_POOL_TVL,
+                "vol_24h":       config.ESTIMATED_POOL_DAILY_VOLUME,
+                "daily_lp_fees": config.ESTIMATED_POOL_DAILY_VOLUME * 0.003 * (1 - config.LP_TREASURY_CUT),
+                "source":        "fallback",
+            }
+            self._gt_pool_cache[pool_id] = (now - config.POOL_STATS_REFRESH_INTERVAL + 30, fallback)
+            return fallback
 
     async def get_byreal_stats(self) -> dict:
         """Byreal 프로토콜 TVL + 24h LP 수수료 수익 조회 (DeFi Llama, 캐시 적용).
