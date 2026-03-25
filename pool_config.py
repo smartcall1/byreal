@@ -16,6 +16,7 @@ class PoolConfig:
     capital:     float  # 배정 자본 (USDC)
     fee_tier:    float  # 수수료율 %
     gt_pool_id:  str    # GeckoTerminal Solana 풀 주소
+    leverage:    float = 1.0  # Perps 헤지 레버리지 (자본 효율화)
 
 
 # ── 4개 풀 설정 ────────────────────────────────────────────
@@ -35,6 +36,7 @@ POOL_CONFIGS: list[PoolConfig] = [
         capital     = 250.0,
         fee_tier    = 0.3,
         gt_pool_id  = "9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq",
+        leverage    = 2.0,   # 중간 변동성 → 청산 버퍼 ~20%
     ),
     PoolConfig(
         name        = "XAUt0/USDT",
@@ -44,6 +46,7 @@ POOL_CONFIGS: list[PoolConfig] = [
         capital     = 250.0,
         fee_tier    = 0.3,
         gt_pool_id  = "9KWAAyaYF7nmMWzirnBmVhE1q4YXPHcXjzfi6YreNtDY",  # TVL 큰 풀
+        leverage    = 3.0,   # 저변동성 금 → 버퍼 충분, 자본효율 극대화
     ),
     PoolConfig(
         name        = "WETH/USDC",
@@ -53,6 +56,7 @@ POOL_CONFIGS: list[PoolConfig] = [
         capital     = 250.0,
         fee_tier    = 0.3,
         gt_pool_id  = "HGxMfonx2vMRGVpHNvj6JbVM5JUjN8xYFS1UGXMYeaAo",
+        leverage    = 2.0,   # 중간 변동성 → 청산 버퍼 ~20%
     ),
     PoolConfig(
         name        = "HYPE/USDC",
@@ -62,6 +66,7 @@ POOL_CONFIGS: list[PoolConfig] = [
         capital     = 250.0,
         fee_tier    = 0.3,
         gt_pool_id  = "DF5SshvX3XTKcvJNxi384FYvfeog7ih9kb89hGbaQBpA",
+        leverage    = 1.3,   # 고변동성 DEX 토큰 → 보수적, 청산 버퍼 ~24%
     ),
 ]
 

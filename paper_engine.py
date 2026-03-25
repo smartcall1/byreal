@@ -43,6 +43,7 @@ class PerpPosition:
     size: float          # ETH 수량 (Short, 현재 오픈 잔량)
     entry_price: float   # 오픈 포지션 평균 진입가
     margin: float        # 증거금 (USDC)
+    leverage: float = 1.0           # 레버리지 배수
     funding_received: float = 0.0   # 수령한 펀딩 누적
     realized_pnl: float = 0.0       # 리밸런싱 시 실현된 PnL 누적
     unrealized_pnl: float = 0.0     # 현재 오픈 포지션의 미실현 PnL
@@ -51,6 +52,18 @@ class PerpPosition:
     @property
     def pnl(self) -> float:
         return self.realized_pnl + self.unrealized_pnl
+
+    @property
+    def liquidation_price(self) -> float:
+        """Short 청산가. 마진 80% 소진 시점 (Hyperliquid 기준).
+
+        Short PnL = (entry - current) × size
+        손실 = (current - entry) × size = 0.8 × margin
+        → liq_price = entry + 0.8 × margin / size
+        """
+        if self.size <= 0:
+            return float("inf")
+        return self.entry_price + (0.8 * self.margin) / self.size
 
 
 @dataclass
@@ -101,8 +114,14 @@ class PaperTradingEngine:
     # ── 초기화 ──────────────────────────────────────────
 
     async def initialize(self, initial_price: float):
-        lp_capital  = self.initial_capital * config.LP_CAPITAL_RATIO
-        perp_margin = self.initial_capital * (1 - config.LP_CAPITAL_RATIO)
+        # 레버리지 기반 자본 배분
+        # CLMM 중점 기준: LP delta notional ≈ lp_capital × 0.5
+        # 필요 마진 = notional / leverage = lp_capital × 0.5 / leverage
+        # lp_capital + lp_capital × 0.5 / leverage = total
+        # → lp_capital = total / (1 + 0.5 / leverage)
+        leverage    = self.pool_cfg.leverage if self.pool_cfg else 1.0
+        lp_capital  = self.initial_capital / (1 + 0.5 / leverage)
+        perp_margin = self.initial_capital - lp_capital
         self._original_lp_capital = lp_capital
 
         range_pct   = self.pool_cfg.range_pct if self.pool_cfg else config.LP_RANGE_PCT
@@ -133,14 +152,17 @@ class PaperTradingEngine:
             size=initial_delta,
             entry_price=initial_price,
             margin=perp_margin,
+            leverage=leverage,
         )
 
+        liq_price = self.perp.liquidation_price
+        liq_buf   = (liq_price - initial_price) / initial_price * 100
         logger.info("[INIT] ─────────────────────────────────────────")
-        logger.info(f"[INIT] LP 자본   : ${lp_capital:,.2f} USDC")
+        logger.info(f"[INIT] LP 자본   : ${lp_capital:,.2f} USDC  (레버리지 {leverage}x)")
         logger.info(f"[INIT] 범위      : ${price_lower:,.2f} ~ ${price_upper:,.2f}")
         logger.info(f"[INIT] ETH 보유  : {eth:.6f} ETH  |  USDC 보유: {usdc:.2f}")
         logger.info(f"[INIT] 초기 델타 : {initial_delta:.6f} ETH → Short 진입")
-        logger.info(f"[INIT] Perp 마진 : ${perp_margin:,.2f} USDC")
+        logger.info(f"[INIT] Perp 마진 : ${perp_margin:,.2f} USDC  |  청산가: ${liq_price:,.2f}  (버퍼 {liq_buf:.1f}%)")
         logger.info("[INIT] ─────────────────────────────────────────")
 
     # ── 메인 업데이트 루프 ───────────────────────────────
@@ -189,6 +211,10 @@ class PaperTradingEngine:
 
         # 4. Perp 미실현 PnL 갱신 (리밸런싱 이후 최신 size/entry_price 기준)
         self.perp.unrealized_pnl = (self.perp.entry_price - current_price) * self.perp.size
+
+        # 5. 청산 버퍼 점검 (레버리지 > 1인 경우)
+        if self.perp.leverage > 1.0:
+            self._check_liquidation_buffer(current_price)
 
         return rebalanced
 
@@ -262,8 +288,9 @@ class PaperTradingEngine:
         new_capital = lp_value_before - slippage_cost - tx_cost
 
         # 새 범위 (현재가 중심)
-        new_lower = current_price * (1 - config.LP_RANGE_PCT / 100)
-        new_upper = current_price * (1 + config.LP_RANGE_PCT / 100)
+        range_pct = self.pool_cfg.range_pct if self.pool_cfg else config.LP_RANGE_PCT
+        new_lower = current_price * (1 - range_pct / 100)
+        new_upper = current_price * (1 + range_pct / 100)
 
         new_L   = clmm_math.calc_liquidity_from_deposit(new_capital, current_price, new_lower, new_upper)
         new_eth, new_usdc = clmm_math.get_amounts(new_L, current_price, new_lower, new_upper)
@@ -319,6 +346,64 @@ class PaperTradingEngine:
             f"총비용: ${total_cost:.4f} (슬리피지 ${slippage_cost:.4f} + 가스 ${tx_cost:.4f} + Perp ${perp_cost:.4f})"
         )
         return True
+
+    # ── 청산 버퍼 관리 ───────────────────────────────────
+
+    def _check_liquidation_buffer(self, current_price: float):
+        """청산가까지의 버퍼를 점검하고, 위험 시 마진을 자동 보충한다."""
+        if not self.perp or self.perp.size <= 0:
+            return
+
+        liq_price = self.perp.liquidation_price
+        buffer    = (liq_price - current_price) / current_price
+
+        if buffer < 0:
+            logger.critical(
+                f"[LIQ] LIQUIDATED  현재가 ${current_price:,.2f} > 청산가 ${liq_price:,.2f}"
+            )
+            return
+
+        if buffer < config.LIQUIDATION_BUFFER_EMERGENCY:
+            logger.critical(
+                f"[LIQ] 긴급 마진 추가!  버퍼 {buffer*100:.1f}% < {config.LIQUIDATION_BUFFER_EMERGENCY*100:.0f}%  "
+                f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
+            )
+            self._emergency_topup(current_price)
+        elif buffer < config.LIQUIDATION_BUFFER_WARN:
+            logger.warning(
+                f"[LIQ] 청산 접근  버퍼 {buffer*100:.1f}%  "
+                f"현재가 ${current_price:,.2f}  청산가 ${liq_price:,.2f}"
+            )
+
+    def _emergency_topup(self, current_price: float):
+        """LP 가치 일부를 Perp 마진으로 이전해 청산을 방어한다.
+
+        LP 유동성을 비례 감소시키고 _original_lp_capital도 동일하게 낮춰
+        lp_gain 기준이 흐트러지지 않게 한다. 슬리피지만 비용으로 기록.
+        """
+        if not self.lp or not self.perp:
+            return
+
+        lp_value = self.get_lp_value(current_price)
+        topup    = lp_value * config.MARGIN_TOPUP_RATIO
+        slip     = topup * (config.LP_RESET_SLIPPAGE_PCT / 100)
+        net      = topup - slip
+
+        # LP 유동성 비례 축소
+        ratio = (lp_value - topup) / max(lp_value, 1e-8)
+        self.lp.liquidity        *= ratio
+        self.lp.initial_value    *= ratio
+        self._original_lp_capital = max(0.0, self._original_lp_capital - topup)
+
+        # 마진 보충
+        self.perp.margin += net
+        self.rebalance_costs += slip
+
+        new_liq = self.perp.liquidation_price
+        logger.info(
+            f"[TOPUP] LP → 마진 이전  +${net:.2f}  (슬리피지 ${slip:.4f})  "
+            f"새 마진 ${self.perp.margin:.2f}  새 청산가 ${new_liq:,.2f}"
+        )
 
     # ── 델타 리밸런싱 ────────────────────────────────────
 
@@ -427,3 +512,9 @@ class PaperTradingEngine:
             self.lp.liquidity, current_price,
             self.lp.price_lower, self.lp.price_upper
         )
+
+    def get_liquidation_buffer(self, current_price: float) -> float:
+        """청산가까지 남은 여유 비율 (0.15 = 15%). 음수면 청산 상태."""
+        if not self.perp or self.perp.size <= 0:
+            return 1.0
+        return (self.perp.liquidation_price - current_price) / current_price

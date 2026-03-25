@@ -40,6 +40,12 @@ RANGE_RESET_ENABLED   = os.getenv("RANGE_RESET_ENABLED", "true").lower() == "tru
 LP_RESET_SLIPPAGE_PCT = float(os.getenv("LP_RESET_SLIPPAGE_PCT", "0.15"))  # 출금+입금 각 0.15%
 SOLANA_TX_COST_USDC   = float(os.getenv("SOLANA_TX_COST_USDC", "0.003"))   # Solana 가스비 추정
 
+# ── 청산 버퍼 관리 ───────────────────────────────────────
+# Short 포지션 청산가까지의 여유 비율
+LIQUIDATION_BUFFER_WARN      = float(os.getenv("LIQUIDATION_BUFFER_WARN",      "0.15"))  # 15% 이하 → 경고
+LIQUIDATION_BUFFER_EMERGENCY = float(os.getenv("LIQUIDATION_BUFFER_EMERGENCY", "0.08"))  # 8%  이하 → 긴급 마진 추가
+MARGIN_TOPUP_RATIO           = float(os.getenv("MARGIN_TOPUP_RATIO",           "0.05"))  # 긴급 시 LP 가치의 5% 마진 이전
+
 # ── 리포팅 ───────────────────────────────────────────────
 LOG_INTERVAL = int(os.getenv("LOG_INTERVAL", "60"))  # 콘솔 출력 주기 (초)
 
