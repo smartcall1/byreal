@@ -65,7 +65,8 @@ class MultiPoolRunner:
 
     # ── 통합 리포트 ─────────────────────────────────────────
 
-    def report(self):
+    def report(self, clear: bool = True):
+        import os
         if not self.engines:
             return
 
@@ -73,23 +74,27 @@ class MultiPoolRunner:
         elapsed_str = _fmt_elapsed(elapsed)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ── 헤더 ───────────────────────────────────────────
-        W = 92
+        if clear:
+            os.system("cls" if os.name == "nt" else "clear")
+
+        # ── 컬럼 폭 (ASCII 헤더만 사용 — 한글 폭 불일치 방지) ──
+        #  POOL(14) TVL(7) Cap(6) LPVal(8) Fees(9) Perp(9) Net(9) APR(8) Liq(6) Status
+        W = 96
+        HDR = (f" {'POOL':<14} {'TVL':>7} {'Cap':>6} {'LP Val':>8}"
+               f" {'Fees':>9} {'Perp':>9} {'Net PnL':>9} {'APR':>8} {'Liq':>6}  Status")
         print("=" * W)
-        print(f" BYREAL MULTI-POOL PAPER  |  {now_str}  |  경과: {elapsed_str}  |  #{self.interval_count}")
+        print(f" BYREAL MULTI-POOL PAPER  |  {now_str}  |  elapsed: {elapsed_str}  |  #{self.interval_count}")
         print("=" * W)
-        print(f" {'POOL':<14} {'Pool TVL':>9} {'자본':>7} {'LP':>8} {'수수료':>8} {'Perp':>8} {'순P&L':>8} {'APR':>7} {'LiqBuf':>7} {'상태':>6}")
+        print(HDR)
         print(" " + "─" * (W - 2))
 
         total_capital = total_net = total_fees = total_perp = 0.0
-        all_in_range = True
-
         rows = []
+
         for name, engine in self.engines.items():
             if not engine.lp or not engine.perp:
                 continue
             cfg = engine.pool_cfg
-
             try:
                 price    = self._last_prices.get(name, engine.lp.entry_price)
                 lp_val   = engine.get_lp_value(price)
@@ -99,63 +104,49 @@ class MultiPoolRunner:
                 capital  = cfg.capital
                 in_range = engine.lp.in_range
                 resets   = engine.range_reset_count
-
-                apr_pct = (
+                apr_pct  = (
                     (net_pnl / capital) * (8760 / (elapsed / 3600)) * 100
-                    if elapsed >= 600 else None  # 10분 미만은 계산 안 함
+                    if elapsed >= 600 else None
                 )
-                liq_buf = engine.get_liquidation_buffer(price) * 100
+                liq_buf  = engine.get_liquidation_buffer(price) * 100
             except Exception:
                 continue
 
-            all_in_range = all_in_range and in_range
             total_capital += capital
             total_net     += net_pnl
             total_fees    += fees
             total_perp    += perp_pnl
 
-            # 풀 TVL (GeckoTerminal 캐시에서)
             gt_cache = self.price_feed._gt_pool_cache.get(cfg.gt_pool_id)
             pool_tvl = gt_cache[1]["tvl"] if gt_cache else 0
-
-            status = "✓ IN" if in_range else f"⚠ OUT(R{resets})"
+            status   = "IN" if in_range else f"OUT R{resets}"
             rows.append((name, pool_tvl, capital, lp_val, fees, perp_pnl, net_pnl, apr_pct, liq_buf, status))
 
         for name, pool_tvl, cap, lp_val, fees, perp, net, apr, liq_buf, status in rows:
-            tvl_str = f"${pool_tvl/1000:.0f}k" if pool_tvl >= 1000 else f"${pool_tvl:.0f}"
-            apr_str = f"{apr:>+6.1f}%" if apr is not None else "   N/A "
+            tvl_str  = f"${pool_tvl/1000:.0f}k" if pool_tvl >= 1000 else f"${pool_tvl:.0f}"
+            cap_str  = f"${cap:>5,.0f}"                    # 6 chars
+            lp_str   = f"${lp_val:>7.2f}"                  # 8 chars
+            fees_str = _fmt_pnl(fees)                       # 9 chars
+            perp_str = _fmt_pnl(perp)                       # 9 chars
+            net_str  = _fmt_pnl(net)                        # 9 chars
+            apr_str  = f"{apr:>+7.1f}%" if apr is not None else "    N/A "  # 8 chars
             buf_flag = "!" if liq_buf < 8 else ("*" if liq_buf < 15 else " ")
-            print(
-                f" {name:<14} {tvl_str:>9} "
-                f"${cap:>6,.0f} "
-                f"${lp_val:>7,.2f} "
-                f"${fees:>+7.4f} "
-                f"${perp:>+7.4f} "
-                f"${net:>+7.4f} "
-                f"{apr_str} "
-                f"{buf_flag}{liq_buf:>5.1f}% "
-                f" {status}"
-            )
+            liq_str  = f"{buf_flag}{liq_buf:>4.1f}%"        # 6 chars
+            print(f" {name:<14} {tvl_str:>7} {cap_str:>6} {lp_str:>8}"
+                  f" {fees_str:>9} {perp_str:>9} {net_str:>9} {apr_str:>8} {liq_str:>6}  {status}")
 
-        # ── 합계 ───────────────────────────────────────────
+        # ── TOTAL ──────────────────────────────────────────
         total_apr = (
             (total_net / max(total_capital, 1)) * (8760 / (elapsed / 3600)) * 100
             if elapsed >= 600 else None
         )
-        in_str = f"{sum(1 for _,e in self.engines.items() if e.lp and e.lp.in_range)}/{len(self.engines)} ✓"
-        total_apr_str = f"{total_apr:>+6.1f}%" if total_apr is not None else "   N/A "
+        in_cnt  = sum(1 for _, e in self.engines.items() if e.lp and e.lp.in_range)
+        in_str  = f"{in_cnt}/{len(self.engines)} IN"
+        apr_str = f"{total_apr:>+7.1f}%" if total_apr is not None else "    N/A "
         print(" " + "═" * (W - 2))
-        print(
-            f" {'TOTAL':<14} {'':>9} "
-            f"${total_capital:>6,.0f} "
-            f"{'':>8} "
-            f"${total_fees:>+7.4f} "
-            f"${total_perp:>+7.4f} "
-            f"${total_net:>+7.4f} "
-            f"{total_apr_str} "
-            f"{'':>7} "
-            f" {in_str}"
-        )
+        print(f" {'TOTAL':<14} {'':>7} ${total_capital:>5,.0f} {'':>8}"
+              f" {_fmt_pnl(total_fees):>9} {_fmt_pnl(total_perp):>9}"
+              f" {_fmt_pnl(total_net):>9} {apr_str:>8} {'':>6}  {in_str}")
         print("=" * W)
 
     # ── WS 실시간 청산 감시 ────────────────────────────────
@@ -192,6 +183,12 @@ def _get_last_price(engine: PaperTradingEngine) -> float:
         return 0.0
     # entry_price 또는 lp.entry_price 사용
     return engine.lp.entry_price
+
+
+def _fmt_pnl(v: float) -> str:
+    """부호 포함 금액 문자열. 예: +$0.0038 / -$0.0032 (8자 고정)"""
+    sign = "+" if v >= 0 else "-"
+    return f"{sign}${abs(v):.4f}"
 
 
 def _fmt_elapsed(seconds: float) -> str:
