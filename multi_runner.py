@@ -5,7 +5,9 @@
 단일 대시보드로 통합 리포팅한다.
 """
 import asyncio
+import csv
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -24,6 +26,8 @@ class MultiPoolRunner:
         self._last_prices: dict[str, float] = {}   # 풀별 마지막 가격 캐시
         self.start_time  = time.time()
         self.interval_count = 0
+        os.makedirs("logs", exist_ok=True)
+        self._csv_path = "logs/multi_pnl_history.csv"
 
     # ── 초기화 ─────────────────────────────────────────────
 
@@ -66,19 +70,17 @@ class MultiPoolRunner:
     # ── 통합 리포트 ─────────────────────────────────────────
 
     def report(self, clear: bool = True):
-        import os
         if not self.engines:
             return
 
         elapsed = time.time() - self.start_time
         elapsed_str = _fmt_elapsed(elapsed)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elapsed_h = elapsed / 3600
 
         if clear:
             os.system("cls" if os.name == "nt" else "clear")
 
-        # ── 컬럼 폭 (ASCII 헤더만 사용 — 한글 폭 불일치 방지) ──
-        #  POOL(14) TVL(7) Cap(6) LPVal(8) Fees(9) Perp(9) Net(9) APR(8) Liq(6) Status
         W = 96
         HDR = (f" {'POOL':<14} {'TVL':>7} {'Cap':>6} {'LP Val':>8}"
                f" {'Fees':>9} {'Perp':>9} {'Net PnL':>9} {'APR':>8} {'Liq':>6}  Status")
@@ -90,6 +92,7 @@ class MultiPoolRunner:
 
         total_capital = total_net = total_fees = total_perp = 0.0
         rows = []
+        csv_rows = []
 
         for name, engine in self.engines.items():
             if not engine.lp or not engine.perp:
@@ -101,11 +104,17 @@ class MultiPoolRunner:
                 net_pnl  = engine.get_net_pnl(price)
                 fees     = engine.lp.fees_accrued
                 perp_pnl = engine.perp.pnl
+                funding  = engine.perp.funding_received
+                il       = engine.get_il(price)
+                entry_c  = engine.entry_costs
+                rebal_c  = engine.rebalance_costs
+                reset_c  = engine.reset_costs
+                total_c  = entry_c + rebal_c + reset_c
                 capital  = cfg.capital
                 in_range = engine.lp.in_range
                 resets   = engine.range_reset_count
                 apr_pct  = (
-                    (net_pnl / capital) * (8760 / (elapsed / 3600)) * 100
+                    (net_pnl / capital) * (8760 / elapsed_h) * 100
                     if elapsed >= 600 else None
                 )
                 liq_buf  = engine.get_liquidation_buffer(price) * 100
@@ -120,24 +129,46 @@ class MultiPoolRunner:
             gt_cache = self.price_feed._gt_pool_cache.get(cfg.gt_pool_id)
             pool_tvl = gt_cache[1]["tvl"] if gt_cache else 0
             status   = "IN" if in_range else f"OUT R{resets}"
-            rows.append((name, pool_tvl, capital, lp_val, fees, perp_pnl, net_pnl, apr_pct, liq_buf, status))
+            rows.append((name, pool_tvl, capital, lp_val, fees, perp_pnl, net_pnl,
+                         apr_pct, liq_buf, status, il, entry_c, rebal_c, reset_c, total_c, funding))
+            csv_rows.append({
+                "timestamp":    datetime.now(timezone.utc).isoformat(),
+                "elapsed_h":    round(elapsed_h, 4),
+                "pool":         name,
+                "price":        round(price, 4),
+                "lp_value":     round(lp_val, 4),
+                "il":           round(il, 4),
+                "fees":         round(fees, 4),
+                "perp_pnl":     round(perp_pnl, 4),
+                "funding":      round(funding, 4),
+                "entry_costs":  round(entry_c, 4),
+                "rebal_costs":  round(rebal_c, 4),
+                "reset_costs":  round(reset_c, 4),
+                "total_costs":  round(total_c, 4),
+                "net_pnl":      round(net_pnl, 4),
+                "apr_pct":      round(apr_pct, 2) if apr_pct is not None else None,
+                "resets":       resets,
+                "in_range":     in_range,
+            })
 
-        for name, pool_tvl, cap, lp_val, fees, perp, net, apr, liq_buf, status in rows:
+        # ── 메인 테이블 출력 ───────────────────────────────
+        for row in rows:
+            name, pool_tvl, cap, lp_val, fees, perp, net, apr, liq_buf, status = row[:10]
             tvl_str  = f"${pool_tvl/1000:.0f}k" if pool_tvl >= 1000 else f"${pool_tvl:.0f}"
-            cap_str  = f"${cap:>5,.0f}"                    # 6 chars
-            lp_str   = f"${lp_val:>7.2f}"                  # 8 chars
-            fees_str = _fmt_pnl(fees)                       # 9 chars
-            perp_str = _fmt_pnl(perp)                       # 9 chars
-            net_str  = _fmt_pnl(net)                        # 9 chars
-            apr_str  = f"{apr:>+7.1f}%" if apr is not None else "    N/A "  # 8 chars
+            cap_str  = f"${cap:>5,.0f}"
+            lp_str   = f"${lp_val:>7.2f}"
+            fees_str = _fmt_pnl(fees)
+            perp_str = _fmt_pnl(perp)
+            net_str  = _fmt_pnl(net)
+            apr_str  = f"{apr:>+7.1f}%" if apr is not None else "    N/A "
             buf_flag = "!" if liq_buf < 8 else ("*" if liq_buf < 15 else " ")
-            liq_str  = f"{buf_flag}{liq_buf:>4.1f}%"        # 6 chars
+            liq_str  = f"{buf_flag}{liq_buf:>4.1f}%"
             print(f" {name:<14} {tvl_str:>7} {cap_str:>6} {lp_str:>8}"
                   f" {fees_str:>9} {perp_str:>9} {net_str:>9} {apr_str:>8} {liq_str:>6}  {status}")
 
         # ── TOTAL ──────────────────────────────────────────
         total_apr = (
-            (total_net / max(total_capital, 1)) * (8760 / (elapsed / 3600)) * 100
+            (total_net / max(total_capital, 1)) * (8760 / elapsed_h) * 100
             if elapsed >= 600 else None
         )
         in_cnt  = sum(1 for _, e in self.engines.items() if e.lp and e.lp.in_range)
@@ -148,6 +179,27 @@ class MultiPoolRunner:
               f" {_fmt_pnl(total_fees):>9} {_fmt_pnl(total_perp):>9}"
               f" {_fmt_pnl(total_net):>9} {apr_str:>8} {'':>6}  {in_str}")
         print("=" * W)
+
+        # ── IL / 비용 분석 섹션 ────────────────────────────
+        IL_HDR = (f" {'POOL':<14} {'IL':>9} {'Fees':>9} {'EntryCst':>9}"
+                  f" {'RstCst':>8} {'RblCst':>8} {'TotCost':>9}  Fee/Cost")
+        print(f"\n IL & COST BREAKDOWN  (보수적 비용 반영 — 슬리피지 0.5%/side, 진입비 0.2%)")
+        print(" " + "─" * (W - 2))
+        print(IL_HDR)
+        print(" " + "─" * (W - 2))
+        for row in rows:
+            name = row[0]
+            fees = row[4]
+            il, entry_c, rebal_c, reset_c, total_c = row[10], row[11], row[12], row[13], row[14]
+            fee_cost_ratio = (fees / total_c) if total_c > 1e-8 else float("inf")
+            fc_str = f"{fee_cost_ratio:.1f}x" if fee_cost_ratio != float("inf") else "  ∞"
+            print(f" {name:<14} {_fmt_pnl(il):>9} {_fmt_pnl(fees):>9} {_fmt_pnl(-entry_c):>9}"
+                  f" {_fmt_pnl(-reset_c):>8} {_fmt_pnl(-rebal_c):>8} {_fmt_pnl(-total_c):>9}  {fc_str}")
+        print(" " + "─" * (W - 2))
+
+        # ── CSV 저장 ───────────────────────────────────────
+        if csv_rows:
+            self._append_csv(csv_rows)
 
     # ── WS 실시간 청산 감시 ────────────────────────────────
 
@@ -168,6 +220,14 @@ class MultiPoolRunner:
                 self._last_prices[name] = price
                 engine._check_liquidation_buffer(price)
             await asyncio.sleep(1)
+
+    def _append_csv(self, rows: list[dict]):
+        write_header = not os.path.exists(self._csv_path)
+        with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
 
     def final_report(self):
         logger.info("━" * 80)

@@ -101,9 +101,14 @@ class PaperTradingEngine:
         self.initial_capital    = pool_cfg.capital if pool_cfg else config.INITIAL_CAPITAL
         self._original_lp_capital: float = 0.0  # 최초 LP 투입 자본, 불변
 
+        # 비용 추적 (항목별 분리)
+        self.entry_costs        = 0.0  # 초기 LP 슬리피지 + 최초 Perp 진입 taker fee
+        self.rebalance_costs    = 0.0  # 델타 리밸런싱 Perp taker fee
+        self.reset_costs        = 0.0  # 범위 리셋 시 Perp close/reopen taker fee
+        # ※ 리셋 슬리피지/가스/스왑은 new_capital 차감으로 LP 가치에 이미 반영
+
         # 리밸런싱 (Perp Short 조정)
         self.rebalance_count    = 0
-        self.rebalance_costs    = 0.0
         self.rebalance_history: list[RebalanceRecord] = []
         self._last_rebalance_ts = 0.0
 
@@ -159,6 +164,11 @@ class PaperTradingEngine:
             leverage=leverage,
         )
 
+        # 초기 진입 비용 (보수적 페이퍼 반영)
+        lp_entry_cost   = lp_capital * (config.LP_ENTRY_SLIPPAGE_PCT / 100)
+        perp_init_cost  = initial_delta * initial_price * config.PERP_TAKER_FEE
+        self.entry_costs = lp_entry_cost + perp_init_cost
+
         liq_price = self.perp.liquidation_price
         liq_buf   = (liq_price - initial_price) / initial_price * 100
         logger.info("[INIT] ─────────────────────────────────────────")
@@ -167,6 +177,7 @@ class PaperTradingEngine:
         logger.info(f"[INIT] ETH 보유  : {eth:.6f} ETH  |  USDC 보유: {usdc:.2f}")
         logger.info(f"[INIT] 초기 델타 : {initial_delta:.6f} ETH → Short 진입")
         logger.info(f"[INIT] Perp 마진 : ${perp_margin:,.2f} USDC  |  청산가: ${liq_price:,.2f}  (버퍼 {liq_buf:.1f}%)")
+        logger.info(f"[INIT] 진입 비용 : ${self.entry_costs:.4f}  (LP 슬리피지 ${lp_entry_cost:.4f} + Perp 진입 ${perp_init_cost:.4f})")
         logger.info("[INIT] ─────────────────────────────────────────")
 
     # ── 메인 업데이트 루프 ───────────────────────────────
@@ -284,12 +295,14 @@ class PaperTradingEngine:
             self.lp.price_lower, self.lp.price_upper,
         )
 
-        # ① 슬리피지 비용 (출금 + 재입금)
+        # ① 슬리피지 비용 (출금 + 재입금, 각 0.5%)
         slippage_cost = lp_value_before * (config.LP_RESET_SLIPPAGE_PCT / 100) * 2
         # ② Solana 가스비 (withdraw + deposit = 2 tx)
         tx_cost = config.SOLANA_TX_COST_USDC * 2
-        # ③ 재투입 자본
-        new_capital = lp_value_before - slippage_cost - tx_cost
+        # ③ 토큰 재배분 스왑 비용 (절반 자산 스왑 필요)
+        swap_cost = lp_value_before * (config.LP_RESET_SWAP_PCT / 100)
+        # ④ 재투입 자본
+        new_capital = lp_value_before - slippage_cost - tx_cost - swap_cost
 
         # 새 범위 (현재가 중심)
         range_pct = self.pool_cfg.range_pct if self.pool_cfg else config.LP_RANGE_PCT
@@ -313,6 +326,9 @@ class PaperTradingEngine:
         self.perp.size         = new_delta
         self.perp.entry_price  = current_price
         self.perp.unrealized_pnl = 0.0
+
+        # Perp 비용 누적 (슬리피지/가스/스왑은 new_capital 차감으로 LP 가치에 이미 반영)
+        self.reset_costs += perp_cost
 
         # 범위 리셋 이력 기록
         rec = RangeResetRecord(
@@ -341,13 +357,14 @@ class PaperTradingEngine:
         self.lp.in_range      = True
         self.lp.last_reset_price = current_price
 
-        total_cost = slippage_cost + tx_cost + perp_cost
+        total_cost = slippage_cost + tx_cost + swap_cost + perp_cost
         logger.info(
             f"[RANGE RESET #{self.range_reset_count}] "
             f"${current_price:,.2f}  |  "
             f"새 범위: ${new_lower:,.0f} ~ ${new_upper:,.0f}  |  "
             f"재투입: ${new_capital:.2f}  |  "
-            f"총비용: ${total_cost:.4f} (슬리피지 ${slippage_cost:.4f} + 가스 ${tx_cost:.4f} + Perp ${perp_cost:.4f})"
+            f"총비용: ${total_cost:.4f} "
+            f"(슬리피지 ${slippage_cost:.4f} + 스왑 ${swap_cost:.4f} + 가스 ${tx_cost:.4f} + Perp ${perp_cost:.4f})"
         )
         return True
 
@@ -516,7 +533,10 @@ class PaperTradingEngine:
         fees    = self.lp.fees_accrued if self.lp else 0.0
         p_pnl   = self.perp.pnl if self.perp else 0.0
         funding = self.perp.funding_received if self.perp else 0.0
-        costs   = self.rebalance_costs  # 범위 리셋 비용은 LP 가치에 이미 반영
+        # entry_costs: 초기 LP 슬리피지 + Perp 진입비
+        # rebalance_costs: 델타 조정 Perp taker fee
+        # reset_costs: 범위 리셋 시 Perp close/reopen fee (슬리피지/가스/스왑은 LP 가치에 이미 반영)
+        costs   = self.entry_costs + self.rebalance_costs + self.reset_costs
         return lp_gain + fees + p_pnl + funding - costs
 
     def get_current_delta(self, current_price: float) -> float:
